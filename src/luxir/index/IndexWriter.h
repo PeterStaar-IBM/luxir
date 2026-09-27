@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include "luxir/util/AtomicSharedPtr.h"
 #include <deque>
 #include <optional>
 #include <string>
@@ -58,7 +59,7 @@ public:
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    AtomicSharedPtr<PostingsReader> sharedPostingsReader = nullptr;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -110,7 +111,7 @@ class IndexWriter {
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
   // Installed after the collection persists the schema.
-  std::atomic<std::shared_ptr<Schema>> currentSchema;
+  AtomicSharedPtr<Schema> currentSchema;
   // Release-stored after currentSchema; search compares without taking indexMutex.
   std::atomic<const Schema*> schemaIdentity;
   // Protected by indexMutex.
@@ -325,7 +326,7 @@ public:
   // The reader searches use. Published under indexReaderMutex, loaded without
   // it: a request the current reader satisfies never waits on a reopen in
   // progress (see getIndexReader).
-  std::atomic<std::shared_ptr<IndexReader>> indexReader;
+  AtomicSharedPtr<IndexReader> indexReader;
   std::shared_ptr<FilterCache> filterCache;
   // Construction-time cache config. Namespace rewinds (testDeleteAllData, a
   // future truncate) rebuild the cache from THIS, not from the installed

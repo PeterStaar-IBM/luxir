@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include "luxir/util/AtomicSharedPtr.h"
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -108,7 +109,7 @@ namespace api::SchemaRequest_ { enum class Mode; }
 class Collection {
   std::string name;
   std::string unavailableReason;  // non-empty means resolution rejects the collection
-  std::atomic<std::shared_ptr<Schema>> schema;  // administration/stats; searches use their reader's schema
+  AtomicSharedPtr<Schema> schema;  // administration/stats; searches use their reader's schema
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
