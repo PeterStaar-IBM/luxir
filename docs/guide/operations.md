@@ -33,10 +33,9 @@ its storage by default.
 A commit makes updates durable and visible to searches. After a crash, Luxir
 reopens the last durable commit. Updates accepted since that commit can be lost.
 
-There is no online snapshot API. For a conservative current backup procedure,
-stop writes, publish a commit, stop the process, and copy the entire data
-directory. Copying the directory while Luxir is writing to it is not a safe
-backup.
+Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
+then `--promote` to restore it as a writer under new collection incarnations.
+Do not restore a raw directory copy over an existing writer identity.
 
 ## Read-only nodes
 
@@ -55,18 +54,19 @@ It serves searches, schema reads, and `_stats`.
 Use it to query a directory another instance is writing, or to inspect one
 offline without risking a stray write. Current limitations:
 
-- **The view does not advance.** A read-only node pins its index view the first
-  time it serves a query and never reopens, so commits the writer publishes
-  after that point are invisible until the read-only node restarts.
-- **`_stats` reports a different point in time** than searches do: it reflects
-  the directory as it was read at startup, while searches reflect the commit
-  pinned at the first query.
+- **The view does not advance.** A read-only node opens its index view at
+  startup and never reopens, so later commits are invisible until it restarts.
+- **`_stats` describes the same snapshot as searches.** Directory byte totals
+  still reflect the files present when stats are requested.
 - **Pinned files are not reclaimed.** Segment files are held open by `mmap`, so
   files the writer deletes stay on disk until the read-only node exits. A
   long-lived read-only node against a busy writer holds disk space that `du`
   attributes to no visible file.
 
 Restart the read-only node to pick up newer commits and release pinned files.
+For a continuously refreshed copy with its own storage, use
+[`--replicate-from http://writer:9400`](replication.md). Followers own their local
+data directory and install verified snapshots without constructing an index writer.
 
 ## Collection lifecycle
 
@@ -85,9 +85,10 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend a deleted collection is first renamed into `trash/`
-under the data directory and then removed; `trash/` is purged again at startup,
-so a crash mid-deletion cannot resurrect a partially deleted collection. If
+On the filesystem backend collections use `c/<name>/<incarnation>/`, selected
+by an atomically replaced `CURRENT` file in `c/<name>/`. Deletion removes and
+syncs `CURRENT` before removing the directory tree, so an interrupted deletion
+cannot reopen the partially deleted index. If
 deletion fails partway (for example an I/O error), the name stays unavailable
 with the recorded error and the delete can simply be retried. Deleting a
 collection that failed to load at startup is also the supported way to clear
@@ -164,19 +165,43 @@ mean something there - `collections` only on the node total, `shards` only on
 node and collection totals.
 
 Totals also report on-disk `bytes`, where the index level counts the whole
-directory (manifest, schema files, in-flight files), so it can exceed the sum
+directory (manifest and in-flight files), so it can exceed the sum
 of segment bytes. With `?segments=true` each segment reports its own `bytes`
 (data + deletes + overlays) and each aux entry reports the bytes of its listed
 files.
 
 Ids and generations that appear in filenames use their filesystem spelling so
 the response correlates directly with a directory listing: each segment's
-`seg` is its data-file prefix (e.g. `s0a`), while `live_gen`, `schema_gen`,
-and aux `gen` are the sortable strings embedded in filenames (segment `s0a`
-with `live_gen` `01` has its deletes in `s0a__L01`; `schema_gen` `02` is the
-file `_schema_02`). These strings sort in generation order, and an absent
-field means none (no deletes file, no schema). Generations that never appear
-on disk (`index_gen`, `core_gen`, `update_version`) stay numeric.
+`seg` is its data-file prefix (e.g. `s0a`), while `live_gen` and aux `gen`
+are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
+`01` has its deletes in `s0a__L01`). These strings sort in generation order,
+and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
+`update_version` are numeric. The schema and its history are embedded in each `s.olux_<index_gen>` manifest.
+
+Filesystem publication syncs new data files and then the directory before
+writing a new `s.olux_<index_gen>` manifest with a length and xxh3 checksum
+footer. It syncs that manifest and then the directory before acknowledging
+the commit. Startup checks the newest manifest's footer and decodes its payload;
+it does not hash data files. Torn candidates are skipped. Fallback candidates
+also require their referenced files to be present with matching sizes.
+
+Once the new root is durable, obsolete manifests and unreferenced data are removed.
+Replication reservation counters are described in the
+[replication reference](replication.md#reference). Every HTTP response has a fixed
+60 s idle deadline per socket write, reset as writes complete. Waiting for a
+query, commit barrier or catalog change does not start a write deadline.
+
+Writer startup removes leftover unreferenced
+index files using the directory listing, without reading their contents. If
+startup falls back below the highest manifest generation, it logs an error and
+skips this sweep, preserving newer files for recovery.
+
+Removals are not directory-synced: a crash may restore obsolete names, but the
+newest durable manifest does not reference them. Failed publication candidates
+are removed and the directory is synced best-effort. An error response does not
+guarantee that the commit is absent: a crash or cleanup failure can leave a
+complete, unacknowledged candidate recoverable at startup. The local filename is not part
+of the commit identity: clients use the `incarnation:index_gen` token.
 
 Set log verbosity with:
 
@@ -313,7 +338,10 @@ Engine/server components have drainable shutdown paths, but the current
 them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
 waiting for in-flight requests. Before a planned stop, quiesce producers and
 publish an immediate commit. After an unplanned stop, the filesystem backend
-reopens the last durable commit.
+reopens the last durable commit. If recovery selects an older valid root, a writer
+publishes it under a new incarnation so followers cannot confuse it with an
+older generation of their current source. File retirement does not fsync removals:
+reappearing obsolete files are harmless and a later sweep reclaims them.
 
 At startup, a collection whose top-level index metadata cannot be parsed is
 kept as a tombstone rather than preventing healthy collections from loading.
@@ -327,9 +355,9 @@ detected when the affected reader is opened.
 Before treating Luxir as a production service, account explicitly for the
 features it does not yet supply:
 
-- single node, with no replication or distributed query execution;
+- no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no online snapshot or restore API;
+- no scheduled backups or automatic restore (use `luxir pull` and `--promote`);
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 

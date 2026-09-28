@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "test/DurableIndexInfo.h"
 
 #include <algorithm>
 #include <array>
@@ -122,7 +123,8 @@ std::string wideTerm(int32_t ord) {
 
 void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   auto schema = compoundSchema();
-  IndexWriter writer(directory, schema);
+  CommitSnapshotRegistry writerSnapshots(directory);
+  IndexWriter writer(writerSnapshots, schema);
   Inverter& inverter = writer.obtainInverter();
   std::string firstTag = largeTagBytes == 0
       ? std::string("x") : patternedBytes(largeTagBytes);
@@ -145,7 +147,8 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
 
   writer.releaseInverter(inverter, true);
   writer.commit();
-  auto reader = writer.getIndexReader();
+  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
+  auto reader = writer.snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   Segment& segment = reader->segments()[0];
   auto baseFiles = baseSegmentFiles(directory, segment.segInfo.seg_id);
@@ -237,13 +240,14 @@ void addMergeSource(IndexWriter& writer, int32_t source,
 
 void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
   auto schema = compoundSchema();
-  IndexWriter writer(directory, schema);
+  CommitSnapshotRegistry writerSnapshots(directory);
+  IndexWriter writer(writerSnapshots, schema);
   writer.mergePolicy->setMergeFactor(1000);
   for (int32_t source = 0; source < 3; source++) {
     addMergeSource(writer, source, tagBytes);
   }
 
-  auto sources = writer.getIndexReader();
+  auto sources = writer.snapshots.readers.getReader();
   ASSERT_EQ(3u, sources->segments().size());
   for (Segment& segment : sources->segments()) {
     EXPECT_EQ(1u, baseSegmentFiles(directory, segment.segInfo.seg_id).size());
@@ -252,7 +256,7 @@ void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
 
   writer.mergeSegments();
   writer.commit();
-  auto merged = writer.getIndexReader();
+  auto merged = writer.snapshots.readers.getReader();
   ASSERT_EQ(1u, merged->segments().size());
   Segment& segment = merged->segments()[0];
   EXPECT_EQ(3, segment.maxDoc());
@@ -363,7 +367,16 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   streams[2]->flush();
 
   for (auto& stream : streams) stream.reset();
-  writer.finish();
+  std::vector<FileDescriptor> descriptors;
+  writer.finish(nullptr, &descriptors);
+  ASSERT_EQ(2u, descriptors.size());
+  for (const auto& descriptor : descriptors) {
+    auto file = directory.openFile(descriptor.name);
+    ASSERT_NE(nullptr, file);
+    auto bytes = file->read();
+    EXPECT_EQ(descriptor.size, bytes.size());
+    EXPECT_EQ(descriptor.xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  }
 
   std::string seg = Postings::getSortableString(17);
   std::vector<Directory::FileInfo> files;
@@ -528,7 +541,9 @@ TEST(CompoundFileTest, DelegatingFlushAndMergeChargeBudget) {
     Signal::unlisten("postingsBeforeCollapse");
   });
 
-  IndexWriter writer(directory, schema, &budget);
+  CommitSnapshotRegistry writerSnapshots(directory);
+
+  IndexWriter writer(writerSnapshots, schema, &budget);
   writer.mergePolicy->setMergeFactor(1000);
   Inverter& first = writer.obtainInverter();
   first.startDoc();
@@ -564,7 +579,8 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
   TempDirectory temp;
   FSDirectory directory(temp.path());
   auto schema = compoundSchema();
-  IndexWriter writer(directory, schema);
+  CommitSnapshotRegistry writerSnapshots(directory);
+  IndexWriter writer(writerSnapshots, schema);
   writer.mergePolicy->setMergeFactor(1000);
   writer.termPartitionMinBytes = 1;
   writer.termPartitionMinRangeBytes = 1;
@@ -589,7 +605,8 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
 
   writer.mergeSegments();
   writer.commit();
-  auto reader = writer.getIndexReader();
+  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
+  auto reader = writer.snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   PostingsReader& postings = reader->segments()[0].postingsReader();
   SegFieldInfo info = fieldInfo(postings, "body");

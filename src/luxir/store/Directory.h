@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -36,6 +37,7 @@ public:
     std::function<void(int64_t)> ramBytesChanged;
     size_t ramSpillBytes = 0;
     bool ramDelegating = false;
+    std::optional<uint64_t> expectedSize;
   };
 
   struct FileInfo {
@@ -105,6 +107,26 @@ public:
     return total;
   }
 
+  virtual Directory& underlying() { return *this; }
+  // Install an immutable file without copying its bytes (same storage backend).
+  virtual void linkFile(Directory& source, std::string_view name) = 0;
+
+  // Only descriptors from a published snapshot authorize reuse; filenames alone
+  // are not identities across collection incarnations.
+  std::vector<FileDescriptor> reuseFiles(Directory& source, std::span<const FileDescriptor> available,
+                                        std::span<const FileDescriptor> wanted) {
+    std::map<std::string_view, const FileDescriptor*> byName;
+    for (const auto& file : available) byName.emplace(file.name, &file);
+    std::vector<FileDescriptor> reused;
+    for (const auto& file : wanted) {
+      auto it = byName.find(file.name);
+      if (it == byName.end() || *it->second != file) continue;
+      if (!openFile(file.name)) linkFile(source, file.name);
+      else continue; // An unpublished candidate must be verified by its caller.
+      reused.push_back(file);
+    }
+    return reused;
+  }
   virtual ~Directory() = default;
 };
 
@@ -116,11 +138,13 @@ public:
   using InputReferenceType = std::shared_ptr<InputFileType>;
 
 private:
+  std::shared_ptr<StorageMemory> memory;
   gtl::btree_map<std::string, InputReferenceType> files;
   std::mutex mutex;
 
 public:
-  RAMDir() = default;
+  explicit RAMDir(std::shared_ptr<StorageMemory> memory = std::make_shared<StorageMemory>()) : memory(std::move(memory)) {}
+  uint64_t storageBytes() const { return memory->bytes(); }
 
   // Only used by tests to clear (e.g. dir = RAMDir())
   void operator=(RAMDir&& other) {
@@ -175,17 +199,31 @@ public:
 
   std::unique_ptr<File> createFile(const std::string_view name) override {
     DIR_DEBUG("DIR about to createFile {}", name);
-    return std::make_unique<OutputFileType>(name);
+    return std::make_unique<OutputFileType>(name, memory);
+  }
+
+  std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions options) override {
+    if (options.expectedSize) {
+      if (*options.expectedSize > SIZE_MAX) throw FileIOException("RAM file is too large");
+      return std::make_unique<SizedRAMFile>(name, (size_t)*options.expectedSize, memory);
+    }
+    return createFile(name);
   }
 
   void finishFile(File &file) override {
     DIR_DEBUG("DIR about to finishFile {} size={}", file.name(), file.size());
 
-    auto &ramFile = dynamic_cast<OutputFileType &>(file);
-    auto sz = ramFile.size();
-    std::unique_ptr<char[]> singleBuffer = std::make_unique_for_overwrite<char[]>(sz);
-    ramFile.copyTo(singleBuffer.get());
-    auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
+    std::shared_ptr<RAMInputFile> inputFile;
+    if (auto sized = dynamic_cast<SizedRAMFile*>(&file)) {
+      inputFile = sized->finish();
+    } else {
+      auto& ramFile = dynamic_cast<OutputFileType&>(file);
+      auto sz = ramFile.size();
+      StorageCharge charge(memory, sz);
+      auto singleBuffer = std::make_unique_for_overwrite<char[]>(sz);
+      ramFile.copyTo(singleBuffer.get());
+      inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz, std::move(charge));
+    }
 
     {
       std::lock_guard<std::mutex> lock(mutex);
@@ -205,6 +243,13 @@ public:
     auto value = std::move(it->second);
     files.erase(it);
     files[std::string(to)] = std::move(value);
+  }
+
+  void linkFile(Directory& source, std::string_view name) override {
+    auto input = std::dynamic_pointer_cast<RAMInputFile>(source.openFile(name, true));
+    if (!input) throw std::runtime_error("RAM link source missing or incompatible");
+    std::lock_guard lock(mutex);
+    files[std::string(name)] = std::move(input);
   }
 
   void clear() override {

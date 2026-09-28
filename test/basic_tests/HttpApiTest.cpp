@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/store/Manifest.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -118,6 +119,22 @@ protected:
       if (auto* s = id.get_if<std::string>()) out.push_back(*s);
     }
     return out;
+  }
+
+  static void expectResponsesDifferOnlyByIncarnation(std::string_view first, std::string_view second) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::UpdateResponse a, b;
+    ASSERT_TRUE(api::read_json(a, first, arena));
+    ASSERT_TRUE(api::read_json(b, second, arena));
+    ASSERT_FALSE(a.commit.empty());
+    ASSERT_FALSE(b.commit.empty());
+    EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
+    EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
+    a.commit = b.commit = {};
+    std::string normalizedA, normalizedB;
+    ASSERT_TRUE(api::write_json(a, normalizedA));
+    ASSERT_TRUE(api::write_json(b, normalizedB));
+    EXPECT_EQ(normalizedA, normalizedB);
   }
 
   static std::optional<int64_t> updateVersionInLine(const std::string& line) {
@@ -299,11 +316,11 @@ TEST_F(HttpApiTest, prettyExplainAndErrors) {
   }
 }
 
-TEST_F(HttpApiTest, prettyInBandSearchError) {
+TEST_F(HttpApiTest, prettySearchError) {
   helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?pretty",
       R"({"query":{"all":true},"fields":["nosuchfield"]})");
-  ASSERT_EQ(200, res.result_int()) << res.body();
+  ASSERT_EQ(400, res.result_int()) << res.body();
   EXPECT_EQ("application/json", res[http::field::content_type]);
   expectJsonObject(res.body(), true);
   EXPECT_NE(std::string::npos, res.body().find("\"error\":"));
@@ -645,7 +662,7 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   // data-file prefix, and live_gen is absent when there are no deletes.
   auto* seg = (*segments)[0]["seg"].get_if<std::string>();
   ASSERT_NE(nullptr, seg);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
@@ -839,7 +856,7 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
   HttpReq autoOnReq(port());
   autoOnReq.collection(autoOnName).matchQuery("title_w", "missingtoken")
       .fields({"id"}).execute();
-  EXPECT_EQ(200, autoOnReq.status()) << autoOnReq.rawResponse();
+  EXPECT_EQ(404, autoOnReq.status()) << autoOnReq.rawResponse();
   EXPECT_NE(autoOnReq.rawResponse().find("collection '" + autoOnName + "' does not exist"),
             std::string::npos) << autoOnReq.rawResponse();
   EXPECT_THROW(LuxirTest::luxirNode->getCollection(autoOnName), CollectionResolutionError);
@@ -856,7 +873,7 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
       .fields({"id"}).execute();
   localServer.shutdown();
 
-  EXPECT_EQ(200, autoOffReq.status()) << autoOffReq.rawResponse();
+  EXPECT_EQ(404, autoOffReq.status()) << autoOffReq.rawResponse();
   EXPECT_NE(autoOffReq.rawResponse().find("collection '" + autoOffName + "' does not exist"),
             std::string::npos) << autoOffReq.rawResponse();
   EXPECT_THROW(node.getCollection(autoOffName), CollectionResolutionError);
@@ -930,9 +947,11 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  {
-    std::ofstream out(base / "c" / "bad" / std::string(Postings::INDEX_INFO_FILE),
-                      std::ios::binary | std::ios::trunc);
+  FSDirectory container(base / "c" / "bad");
+  auto incarnation = DirectoryFactory::current(container).incarnation;
+  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad" / incarnation)) {
+    if (!Manifest::generationOf(file.path().filename().string())) continue;
+    std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
   }
 
@@ -1408,8 +1427,8 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
   EXPECT_EQ((int64_t)128, serial.plainCount);
   EXPECT_EQ(serial.plainCount, pipelined.plainCount);
-  EXPECT_EQ(serial.plainResponse, pipelined.plainResponse);
-  EXPECT_EQ(serial.overwriteResponse, pipelined.overwriteResponse);
+  expectResponsesDifferOnlyByIncarnation(serial.plainResponse, pipelined.plainResponse);
+  expectResponsesDifferOnlyByIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
   EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
   ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
   for (int id = 0; id < 12; id++) {
@@ -1502,7 +1521,7 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
   EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
   EXPECT_EQ((int64_t)2, serial.found);
-  EXPECT_EQ(serial.response, pipelined.response);
+  expectResponsesDifferOnlyByIncarnation(serial.response, pipelined.response);
   EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
   EXPECT_EQ(serial.found, pipelined.found);
 }
@@ -2000,6 +2019,16 @@ TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
   EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, ndjsonUrlCommitLeavesUntouchedDefaultUnpublished) {
+  auto before = helper.collection().getShard()->getSnapshots().snapshot()->id;
+  ASSERT_TRUE(helper.index(flatdoc("id", "pending")).success);
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+      "{\"_update_\":{\"collection\":\"other_eof\"}}\n{\"id\":\"other\"}\n", "application/x-ndjson");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(before, helper.collection().getShard()->getSnapshots().snapshot()->id);
+  EXPECT_EQ(1, luxirNode->getCollection("other_eof")->getReaderManager().getReader()->liveDocs());
+}
+
 TEST_F(HttpApiTest, jsonUrlCommitCommits) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
                             R"({"docs":[{"id":"jurlc1","title_w":"jsonurlcommit token"}]})");
@@ -2048,7 +2077,7 @@ TEST_F(HttpApiTest, jsonInvalidUrlCommitRejected) {
 TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   LuxirNode node;
   auto writer = node.getCollection("main")->getShard()->getIndexWriter();
-  std::uint64_t before = writer->getIndexReader()->commitTime();
+  std::uint64_t before = writer->snapshots.readers.getReader()->commitTime();
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -2058,8 +2087,12 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   localServer.shutdown();
 
   ASSERT_EQ(200, update.result_int()) << update.body();
-  EXPECT_EQ(1u, splitLines(update.body()).size()) << update.body();
-  EXPECT_GT(writer->getIndexReader()->commitTime(), before);
+  EXPECT_EQ(2u, splitLines(update.body()).size()) << update.body();
+  auto lines = splitLines(update.body());
+  glz::generic_i64 eof;
+  ASSERT_FALSE(glz::read_json(eof, lines.back()));
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
+  EXPECT_GT(writer->snapshots.readers.getReader()->commitTime(), before);
 }
 
 TEST_F(HttpApiTest, ndjsonAllOrNoneStreamSuccess) {
@@ -3558,7 +3591,7 @@ TEST_F(HttpApiTest, emitterExceptionCompletesWithError) {
   // join and batch-arena cleanup, not just the error surface.
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"all":true},"batch_size":1,"fields":["id","nosuchfield"]})");
-  EXPECT_EQ(200, res.result_int());
+  EXPECT_EQ(400, res.result_int());
   EXPECT_NE(std::string::npos, res.body().find(R"("error":)")) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("nosuchfield")) << res.body();
 }
@@ -3719,10 +3752,9 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find(R"("code":"invalid_collection_name")"), std::string::npos)
       << update.body();
-  // A search resolves its collection after submission, so the same failure is
-  // the in-band error line.
+  // Resolving after submission still uses the same pre-output HTTP status.
   auto search = httpRequest(port(), http::verb::get, "/collections/Bad-Name/_search");
-  ASSERT_EQ(200, search.result_int()) << search.body();
+  ASSERT_EQ(400, search.result_int()) << search.body();
   EXPECT_NE(search.body().find(R"({"error":{"kind":"invalid_request","code":"invalid_collection_name")"),
             std::string::npos) << search.body();
 
@@ -3735,10 +3767,10 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   EXPECT_EQ("collection_not_found", root["error"]["code"].get_string());
 }
 
-TEST_F(HttpApiTest, searchFailureAfterSubmissionIsAnErrorLine) {
+TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"request_id":"s1","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
-  ASSERT_EQ(200, res.result_int()) << res.body();
+  ASSERT_EQ(400, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
   EXPECT_NE(lines[0].find(R"({"request_id":"s1","error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),
@@ -3995,6 +4027,30 @@ TEST_F(HttpApiTest, explainResolvedManyVariantTargetsStayInTheBody) {
   std::string encodedNotes;
   ASSERT_FALSE(glz::write_json(envelope["resolved_fields"], encodedNotes));
   EXPECT_GT(encodedNotes.size(), 8192u);
+}
+
+TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"snapshot"}],"commit":{}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  glz::generic_i64 body;
+  ASSERT_FALSE(glz::read_json(body, response.body()));
+  auto commit = CommitId::parse(body["commit"].get<std::string>()).index_gen;
+  auto snapshot = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  EXPECT_EQ((uint64_t)commit, snapshot->index_gen);
+  EXPECT_EQ(CommitId::parse(body["commit"].get<std::string>()).incarnation, snapshot->incarnation);
+  EXPECT_EQ((uint64_t)commit, helper.getIndexWriter()->snapshots.readers.getReader()->commitId());
+  auto streamed = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?commit=true", "{\"id\":\"streamed\"}\n",
+      "application/x-ndjson");
+  ASSERT_EQ(200, streamed.result_int()) << streamed.body();
+  glz::generic_i64 eof;
+  auto lines = splitLines(streamed.body());
+  ASSERT_FALSE(lines.empty());
+  ASSERT_FALSE(glz::read_json(eof, lines.back())) << streamed.body();
+  EXPECT_GT(CommitId::parse(eof["commit"].get<std::string>()).index_gen, commit);
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen,
+            readDurableIndexInfo(helper.getIndexWriter()->dir)->index_gen);
 }
 
 } // namespace luxir::test

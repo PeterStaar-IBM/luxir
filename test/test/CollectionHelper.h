@@ -34,6 +34,7 @@ struct IndexResult {
   };
 
   uint64_t updateVersion = 0;
+  std::optional<CommitId> commit;
   bool success = false;  // false if the message errored or the response status is ERROR
   Status status = Status::UNKNOWN;
   std::string error_message;          // message-level error, if any
@@ -54,6 +55,7 @@ private:
   static void fillResult(ProtoUpdateMessage& msg, IndexResult& out) {
     auto* rsp = msg.finishResponse();
     out.updateVersion = rsp->update_version;
+    if (!rsp->commit.empty()) out.commit = CommitId::parse(rsp->commit);
     out.status = rsp->status;
     out.error_message.clear();
     out.error_code.clear();
@@ -402,7 +404,7 @@ public:
   // True if the current index matches the shape of docsPerSeg (for index reuse).
   bool indexMatchesShape(std::span<const int32_t> docsPerSeg) {
     auto iw = getIndexWriter();
-    auto reader = iw->getIndexReader();
+    auto reader = iw->snapshots.readers.getReader();
     auto readerSegs = reader->segments().size();
     bool reuseIndex = readerSegs == docsPerSeg.size();
     if (reuseIndex) {

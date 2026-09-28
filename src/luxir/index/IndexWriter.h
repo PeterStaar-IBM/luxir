@@ -14,12 +14,13 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include "luxir/index/AuxInfo.h"
+#include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
 #include "luxir/search/IndexReader.h"
-#include "luxir/search/FilterCache.h"
+#include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
@@ -51,6 +52,8 @@ public:
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
+    uint64_t publishedLiveGen = 0; // the generation in the published snapshot
+    std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t firstCommitTime = 0;  // first time this segment was committed as part of the index.
     uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index (or 1 if currently committing)
@@ -77,11 +80,13 @@ public:
     // Filenames written for this segment that have not yet been fsynced.
     // Populated by PostingsWriter::finish() and drained at commit time.
     std::vector<std::string> unsyncedFiles;
+    std::vector<FileDescriptor> files;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
     // participate.
     std::vector<AuxInfo> auxOverlays;
+    uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
@@ -108,14 +113,15 @@ inline std::string format_as(const SegInfo& seg) {
 class IndexWriter {
   // Set once when closing, never cleared.
   std::atomic<bool> closed = false;
+  std::atomic<bool> failed = false;
+  std::shared_ptr<const std::string> failureReason; // immutable once failed is published
+  std::mutex closeMutex;
+  std::mutex publicationMutex; // held only while constructing and publishing a manifest
   std::mutex indexMutex;
-  std::mutex indexReaderMutex;
-  // Installed after the collection persists the schema.
-  AtomicSharedPtr<Schema> currentSchema;
-  // Release-stored after currentSchema; search compares without taking indexMutex.
-  std::atomic<const Schema*> schemaIdentity;
-  // Protected by indexMutex.
-  std::optional<uint64_t> oldestCommittedSchemaGen;
+  std::vector<std::string> manifestNames;
+  std::vector<std::string> pendingRetirement; // publicationMutex
+  uint64_t nextManifestGen = 0;
+  std::string incarnation;
 
 public:
 
@@ -128,53 +134,14 @@ public:
     bool outputPublished = false;
   };
 
-  struct AuxStats {
-    std::string kind;
-    std::string field;
-    std::string name;
-    uint64_t gen = 0;
-    uint64_t commitTime = 0;
-    uint64_t builtCoreGen = 0;
-    uint64_t bytes = 0;
-    std::vector<std::string> files;
-  };
-
-  struct SegmentStats {
-    uint64_t segId = 0;
-    uint64_t liveGen = 0;
-    uint64_t minUpdateVersion = 0;
-    uint64_t maxUpdateVersion = 0;
-    uint64_t firstCommitTime = 0;
-    uint64_t schemaGen = 0;
-    uint64_t bytes = 0;
-    std::vector<AuxStats> overlays;
-    int32_t maxDoc = 0;
-    int32_t liveDocs = 0;
+  using AuxStats = ReaderManager::AuxStats;
+  struct SegmentStats : ReaderManager::SegmentStats {
     int32_t mergeLevel = 0;
-    bool committed = false;
     bool merging = false;
   };
-
-  struct Stats {
-    uint64_t commitTime = 0;
-    uint64_t commits = 0;  // commits performed by this writer instance
-    uint64_t indexGen = 0;
-    uint64_t coreGen = 0;
-    uint64_t updateVersion = 0;
-    uint64_t schemaGen = 0;
-    uint64_t segments = 0;
-    uint64_t committedSegments = 0;
-    uint64_t maxDocs = 0;
-    uint64_t liveDocs = 0;
+  struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
+    uint64_t commits = 0;
     uint64_t activeMerges = 0;
-    uint64_t totalBytes = 0;
-    std::vector<AuxStats> auxIndexes;
-    std::vector<SegmentStats> segmentStats;
-    FilterCache::CounterValues filterCacheCounters;
-    uint64_t filterCacheMaxBytes = 0;
-    uint64_t filterCacheResidentBytes = 0;
-    uint64_t filterCacheMetadataBytes = 0;
-    bool filterCacheEnabled = false;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -323,16 +290,8 @@ public:
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
 
-  // The reader searches use. Published under indexReaderMutex, loaded without
-  // it: a request the current reader satisfies never waits on a reopen in
-  // progress (see getIndexReader).
-  AtomicSharedPtr<IndexReader> indexReader;
-  std::shared_ptr<FilterCache> filterCache;
-  // Construction-time cache config. Namespace rewinds (testDeleteAllData, a
-  // future truncate) rebuild the cache from THIS, not from the installed
-  // cache's config, so a test-assigned replacement cache cannot leak its
-  // policy past a reset of the shared collection.
-  FilterCacheConfig originalFilterCacheConfig;
+  CommitSnapshotRegistry& snapshots;
+  AtomicSharedPtr<const CommitSnapshot> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
 
@@ -397,8 +356,8 @@ public:
   uint64_t schemaGen_ = 0;
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
-  // the IndexInfo file.  Read from s.olux at open, mutated only by the commit
-  // pipeline (single-threaded via the commitFinishNode).  Used for carry-forward
+  // manifest. Both commit and schema publication update these under
+  // publicationMutex. Used for carry-forward
   // (entries not rebuilt by this commit are preserved) and orphan-file cleanup
   // (files referenced by the previous list but not the new one are deleted).
   // Publication and stats reads are protected by indexMutex.
@@ -407,8 +366,7 @@ public:
   // One entry per segment overlay referenced by the last published IndexInfo,
   // keyed by owning segment (the manifest nests overlays under SegmentInfo;
   // this preserves that association in memory).  Consumers: orphan-file
-  // cleanup after publishing a new IndexInfo, gen-ordinal continuity for
-  // drop-then-rebuild (nextVectorOverlayGen), and activation seeding at
+  // cleanup after publishing a new IndexInfo and activation seeding at
   // startup.  The authoritative per-segment copy lives on SegInfo.
   struct PublishedOverlay {
     uint64_t segId;
@@ -423,7 +381,7 @@ public:
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
   // activated in this writer lifetime or were seeded from durable manifest
   // overlays at startup.  Intent-only activation is process-local; startup
-  // seeds only from overlays that actually exist in s.olux.  Protected by
+  // seeds only from overlays that actually exist in the manifest.  Protected by
   // indexMutex.
   boost::unordered_flat_set<std::string> activeVectorOverlayNames;
 
@@ -437,7 +395,6 @@ public:
   // This would allow a searching client to specify a time to search up to.
   // Time of the last commit (since 1970 epoch) in microseconds. Guaranteed to be strictly increasing.
   std::atomic_uint64_t lastCommitTime;
-  std::atomic_uint64_t lastAdvertisedCommitTime;
 
   // Commits performed by this writer instance (process lifetime, not persisted).
   std::atomic_uint64_t commitCount = 0;
@@ -495,10 +452,11 @@ public:
 
   // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
   // reserve against; pass null for a private unlimited budget (tests, embedded).
-  explicit IndexWriter(Directory &dir, std::shared_ptr<Schema> schema = {},
+  // The collection owns snapshots and closes it after draining this writer.
+  // A nonnull schema is for creation only; reopening loads the manifest schema.
+  explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       FilterCacheConfig filterCacheConfig = {},
-                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
+                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {});
   ~IndexWriter();
   void close();
 
@@ -553,28 +511,25 @@ public:
     return startUpdateNode->try_put(msg);
   }
 
+  std::shared_ptr<const std::string> getFailureReason() const {
+    return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
+  }
+
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true
   // is final; the rejection that matters happens in the graph.
   bool isClosed() const {
-    return closed.load(std::memory_order_relaxed);
+    return closed.load(std::memory_order_relaxed) || failed.load(std::memory_order_acquire);
   }
-
-  // Pins a physical snapshot and its schema for the caller's lifetime.
-  std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0);
-
-  std::shared_ptr<FilterCache> getFilterCache() const {
-    return filterCache;
-  }
-
 
   // Obtains an inverter for writing documents and sets its updateVersion.
   // Messages supply their admission pin. Without a pin, use the current schema.
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
-  // Collection serializes schema changes and persists before handing them off.
+  // Publish over the last physical snapshot without waiting for commit preparation.
   void setSchema(std::shared_ptr<Schema> schema);
-  std::string resolvedSchema();
+  std::shared_ptr<Schema> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
+  std::shared_ptr<Schema> getSchema() const { return lastSnapshot.load()->schema; }
 
   // Releases an inverter back to the pool.
   void releaseInverter(Inverter& inverter, bool flush=false);
@@ -584,7 +539,7 @@ public:
 
   // Synchronous commit.  This will effectively block but enter work-stealing mode if there is other work to do.
   // If one is not careful, this work-stealing can result in deadlocks.  Consider using the async version.
-  void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
+  std::optional<CommitId> commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
 
 private:
   void requestPressureCheck() noexcept;
@@ -614,12 +569,13 @@ private:
 
   void startUpdateBody(UpdateMessage& msg) {
     // Rejection must come before the sequence numbers are assigned: they must stay
-    // dense for the sequencer nodes.  Closing is terminal, so nothing follows a
-    // rejected message to leave stranded anyway.
-    if (closed.load(std::memory_order_relaxed)) {
+    // dense for the sequencer nodes. Merge continuations belong to already
+    // admitted work, including automatic merges whose commits also flush.
+    if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
+        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
       throw IndexWriterClosedError("index writer is closed");
     }
-    msg.schema = currentSchema.load();
+    msg.schema = lastSnapshot.load()->schema;
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;
@@ -710,8 +666,11 @@ private:
   bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
+  // Caller holds publicationMutex. A supplied schema is copied before assigning history.
+  void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,
+               std::shared_ptr<Schema> schema = {});
   uint64_t writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& commitInfo,
-                              std::span<const AuxInfo> auxIndexes = {});
+                              std::span<AuxInfo> auxIndexes);
   std::vector<AuxInfo> buildAuxIndexes(const UpdateMessage& msg,
                                                    std::span<SegInfo*> segsToKeep,
                                                    std::vector<std::string>& outFilesToSync);
@@ -722,7 +681,7 @@ private:
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();
-  uint64_t nextVectorOverlayGen(const SegInfo& seg, std::string_view name) const;
+  uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,
@@ -732,13 +691,7 @@ private:
       std::vector<std::string>& outFiles);
   void deleteStagedOverlayFiles(std::span<const std::string> files,
                                 std::string_view context) noexcept;
-  std::vector<PublishedOverlay> flattenSegmentOverlays(std::span<SegInfo*> segs) const;
-  // Delete files referenced by `oldList` that aren't referenced by `newList`.
-  // Call only after the new IndexInfo file is durable.
-  void deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& oldList,
-                              const std::vector<PublishedOverlay>& newList);
-  void deleteOrphanedAuxFiles(const std::vector<AuxInfo>& oldList,
-                              const std::vector<AuxInfo>& newList);
+  // Release writer ownership; reservations can retain the retired files.
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);

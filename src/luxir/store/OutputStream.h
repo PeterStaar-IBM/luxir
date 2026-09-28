@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include "StorageMemory.h"
+
 #include <stdexcept>
+#include <xxhash.h>
 
 #include "InputStream.h"
 
@@ -65,6 +68,13 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+struct FileDescriptor {
+  std::string name;
+  uint64_t size = 0;
+  uint64_t xxh3 = 0;
+  bool operator==(const FileDescriptor&) const = default;
+};
+
 class File {
   friend class OutputStream;
 
@@ -92,6 +102,9 @@ public:
   const std::string& name() { return name_; }
 
   virtual size_t size() = 0;
+  // Valid after close and Directory::finishFile.
+  virtual uint64_t digest() const = 0;
+  FileDescriptor descriptor() { return {name_, size(), digest()}; }
 
   /// Appends the input RAMFile by stealing its buffers. OutputStream::appendFile
   /// is the normal entry point because it also repairs the attached stream.
@@ -105,6 +118,7 @@ class OutputStream {
   friend class File;
 
   friend class RAMFile;
+  friend class SizedRAMFile;
   friend class FSFile;
   friend class RAMDelegatingFile;
 
@@ -146,9 +160,9 @@ public:
   uint32_t reserve(uint32_t needed) {
     if (reserved() < needed) {
       flush();  // TODO: pass down needed amount?
+      if (reserved() < needed) throw FileIOException("output reservation exceeds stream buffer capacity");
     }
-    assert(reserved() >= needed);
-    return reserved();
+    return (uint32_t)std::min(reserved(), (size_t)UINT32_MAX);
   }
 
   char *ptr() const noexcept { return pos; } // the current position in the buffer
@@ -344,17 +358,19 @@ class RAMFile : public File {
   friend class RAMDelegatingFile;
 
   struct Buffer {
+    StorageCharge charge;
     std::unique_ptr<char[]> data;
     size_t used;
     size_t capacity;
   };
 
+  std::shared_ptr<StorageMemory> memory;
   std::vector<Buffer> buffers;
   size_t fileSize = 0;
   size_t allocatedSize = 0;
 
   void newBuffer(size_t size) {
-    buffers.push_back({std::make_unique_for_overwrite<char[]>(size), 0, size});
+    buffers.push_back({StorageCharge(memory, size), std::make_unique_for_overwrite<char[]>(size), 0, size});
     allocatedSize += size;
   }
 
@@ -390,7 +406,7 @@ class RAMFile : public File {
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
-  RAMFile(std::string_view name) : File(name) {
+  RAMFile(std::string_view name, std::shared_ptr<StorageMemory> memory = {}) : File(name), memory(std::move(memory)) {
   }
 
   ~RAMFile() override = default;
@@ -398,6 +414,18 @@ public:
   /// only valid after flush or close
   size_t size() override {
     return fileSize;
+  }
+
+  uint64_t digest() const override {
+    auto* state = XXH3_createState();
+    if (!state) throw std::bad_alloc();
+    XXH3_64bits_reset(state);
+    for (const auto& buffer : buffers) {
+      XXH3_64bits_update(state, buffer.data.get(), buffer.used);
+    }
+    auto result = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    return result;
   }
 
   size_t allocatedBytes() const noexcept { return allocatedSize; }
@@ -435,9 +463,11 @@ public:
   void destructiveAppend(RAMFile &in) override {
     if (this == &in) return; // no-op
     auto otherSize = in.size();
-    for (auto& buffer : in.buffers) {
-      buffers.emplace_back(std::move(buffer));
+    // Charge unaccounted scratch buffers before moving any of them.
+    if (memory) for (auto& buffer : in.buffers) {
+      if (!buffer.charge.charged()) buffer.charge = StorageCharge(memory, buffer.capacity);
     }
+    for (auto& buffer : in.buffers) buffers.emplace_back(std::move(buffer));
     fileSize += otherSize;
     allocatedSize += in.allocatedSize;
     in.fileSize = 0;
@@ -462,6 +492,9 @@ public:
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
   virtual std::string_view read() = 0;
 
+  // Advisory asynchronous readahead; memory-backed inputs need no work.
+  virtual void prefetch(size_t offset, size_t length) {}
+
   virtual InputStream getInputStream() = 0;
 
   friend std::ostream &operator<<(std::ostream &out, InputFile &inf) {
@@ -472,10 +505,12 @@ public:
 };
 
 class RAMInputFile : public InputFile {
+  StorageCharge charge;
   std::unique_ptr<char[]> data;
   size_t sz;
 public:
-  RAMInputFile(std::unique_ptr<char[]> fileData, size_t size) : data(std::move(fileData)), sz(size) {}
+  RAMInputFile(std::unique_ptr<char[]> fileData, size_t size, StorageCharge charge = {})
+      : charge(std::move(charge)), data(std::move(fileData)), sz(size) {}
 
   size_t size() override {
     return sz;
@@ -489,6 +524,42 @@ public:
     return InputStream(data.get(), data.get() + sz);
   }
 
+};
+
+
+class SizedRAMFile : public File {
+  StorageCharge charge;
+  std::unique_ptr<char[]> data;
+  size_t expected, written = 0;
+  uint64_t hash = 0;
+  bool closed = false;
+
+  void flush(OutputStream& out, bool defer) override {
+    written = out.size();
+    out.flushedSize = written;
+    out.start = out.pos = out.end = nullptr;
+    if (!defer) {
+      if (written == expected) throw FileIOException("RAM output exceeds expected size");
+      out.start = out.pos = data.get() + written;
+      out.end = data.get() + expected;
+    }
+  }
+  void close(OutputStream& out) override {
+    flush(out, true);
+    if (written != expected) throw FileIOException("RAM output is shorter than expected size");
+    hash = XXH3_64bits(data.get(), written);
+    closed = true;
+  }
+public:
+  SizedRAMFile(std::string_view name, size_t size, std::shared_ptr<StorageMemory> memory)
+      : File(name), charge(std::move(memory), size), data(std::make_unique_for_overwrite<char[]>(size)), expected(size) {}
+  size_t size() override { return written; }
+  uint64_t digest() const override { return hash; }
+  void destructiveAppend(RAMFile&) override { throw FileIOException("appendFile requires chunked RAM output"); }
+  std::shared_ptr<RAMInputFile> finish() {
+    if (!closed || !data) throw FileIOException("RAM output must be closed exactly once before finish");
+    return std::make_shared<RAMInputFile>(std::move(data), written, std::move(charge));
+  }
 };
 
 

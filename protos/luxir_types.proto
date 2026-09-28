@@ -47,6 +47,12 @@ message SearchRequest {
   // Automatic execution is serial on the receiving thread. Other values
   // are rejected.
   int32 max_parallel = 8;
+
+  // Require a local snapshot at least this new (incarnation:index_gen).
+  // Writers reject a different incarnation immediately; followers wait for a switch.
+  string min_commit = 9;
+  // Search floor deadline. Absent defaults to 30000; zero checks immediately.
+  optional uint64 min_commit_timeout_ms = 10;
 }
 
 enum ResponseFormat {
@@ -755,6 +761,24 @@ message CommitParams {
   // The response waits for the merged layout even when commit_within_ms is
   // positive.
   uint32 max_segments = 4;
+
+  // Decimal follower count or "all". Forces an immediate commit. "all" captures
+  // live followers at commit completion; members that go non-live stop counting.
+  string wait_for_replicas = 5;
+  // Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit.
+  optional uint64 replication_timeout_ms = 6;
+}
+
+message ReplicaResult {
+  // For "all", wanted excludes captured followers that are no longer live.
+  optional uint32 wanted = 1;
+  optional uint32 serving = 2;
+  optional bool timed_out = 3;
+}
+
+message CollectionCommit {
+  string commit = 1;
+  ReplicaResult replicas = 2;
 }
 
 // Index or delete documents, with an optional commit.
@@ -852,6 +876,13 @@ message UpdateResponse {
   // Request-level failure (not tied to a single document), e.g. a failure in the commit
   // pipeline.  Set exactly when status == ERROR for a non-document failure.
   Error error = 6;
+
+  // Resulting snapshot identity; absent without a completed commit.
+  // Snapshot token: incarnation:index_gen.
+  string commit = 8;
+  ReplicaResult replicas = 9;
+  // NDJSON EOF commits covering more than one collection.
+  map<string, CollectionCommit> commits = 10;
 }
 
 
@@ -1037,6 +1068,34 @@ message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
+  StorageRamStats storage_ram = 6;
+}
+
+message ReplicationCollectionStatus {
+  string name = 1;
+  string source_commit = 2;
+  string serving_commit = 3;
+  string state = 4; // syncing, serving, waiting, stale, orphan, error
+  uint64 bytes_downloaded = 5;
+  uint64 bytes_total = 6;
+  string last_error = 7;
+  uint64 next_retry = 8; // Unix milliseconds; zero when not backing off
+}
+message ReplicationStatus {
+  string source = 1;
+  string follower = 2;
+  optional bool connected = 3;
+  uint64 last_contact = 4; // Unix milliseconds
+  repeated ReplicationCollectionStatus collections = 5;
+  repeated FollowerStats followers = 6;
+}
+
+message FollowerStats {
+  string follower = 1;
+  string collection = 2;
+  string commit = 3;
+  uint64 last_seen = 4; // Unix milliseconds
+  optional uint64 lag = 5; // generation distance; absent without a current acknowledgment
 }
 
 // Rolled-up counts.  Only the fields meaningful at a given level are set, so
@@ -1053,15 +1112,21 @@ message StatsTotals {
   uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
 }
 
+message StorageRamStats {
+  uint64 used_bytes = 1; // Allocated RAM file buffers, including output and retained readers.
+  uint64 limit_bytes = 2; // Zero is unlimited. Independent of indexing_ram.
+}
+
 message CollectionStats {
   string name = 1;
   StatsTotals totals = 2;
-  string schema_gen = 3;  // sortable-string spelling (see SegmentStats); empty = no schema
+  uint64 schema_gen = 3; // Schema generation
   repeated ShardStats shards = 4;
 
   // Set for a collection that is not serving (failed to load, or a delete failed
   // partway); kind is UNAVAILABLE and the message is the recorded reason.
   Error error = 5;
+  uint64 storage_ram_bytes = 6;
 }
 
 message ShardStats {
@@ -1075,19 +1140,23 @@ message IndexStats {
   uint64 index_gen = 2;
   uint64 core_gen = 3;
   uint64 update_version = 4;
-  string schema_gen = 5;  // sortable-string spelling (see SegmentStats); empty = no schema
+  uint64 schema_gen = 5; // Schema generation
   uint64 active_merges = 6;
   repeated AuxStats aux_indexes = 7;
   QueryCacheStats query_cache = 8;
   repeated SegmentStats segments = 9;
+  uint64 snapshot_pins = 11;
+  uint64 pin_retained_bytes = 12; // bytes whose only remaining owners are pins
+  uint64 pin_idle_drops = 13;
+  uint64 pin_budget_drops = 14;
 }
 
 // Ids and generations that appear in filenames are reported in their
 // filesystem spelling so stats output correlates directly with directory
 // listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01", schema_gen "02" ->
-// file "_schema_02").  Sortable strings order the same as the numbers they
+// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,
 // update_version) stay numeric.
@@ -1100,7 +1169,7 @@ message SegmentStats {
   int32 max_doc = 6;
   int32 live_docs = 7;
   int32 deleted_docs = 8;
-  string schema_gen = 9;
+  uint64 schema_gen = 9; // Schema generation
   bool committed = 10;
   bool merging = 11;
   uint32 merge_level = 12;

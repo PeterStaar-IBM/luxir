@@ -21,6 +21,11 @@ project(Luxir VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  add_compile_options(-fexperimental-library)
+  add_link_options(-fexperimental-library)
+endif()
+
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
 set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native apple-m1 x86-64-v2 x86-64-v3 x86-64-v4)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

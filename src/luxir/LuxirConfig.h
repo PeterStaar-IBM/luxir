@@ -52,6 +52,7 @@ struct CheckedDirConfig {
 struct StoreConfig {
   std::string backend = "ram";           // ram, fs
   std::string data_dir = "luxir_data";
+  uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
 };
 
@@ -137,13 +138,25 @@ struct SearchConfig {
   size_t request_memory_max_bytes = 0;
 };
 
+struct ReplicationConfig {
+  int64_t pin_idle_timeout_ms = 60'000;
+  uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
+  int64_t follower_timeout_ms = 90'000;
+  std::string source;
+  std::string follower_id;
+  int downloads = 2; // node-wide concurrent collection downloads
+  void validate() const;
+};
+
 struct LuxirConfig {
+  ReplicationConfig replication;
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process
   // query a directory another instance is writing.  The view is the commit that was
   // current when this node started; there is no reopen yet, so later commits by the
   // writer are not picked up until restart.
   bool read_only = false;
+  bool promote = false;
 
   // Node-wide RAM budget (MiB): what this process may use for the memory it
   // manages explicitly - indexing structures today, caches as they are folded

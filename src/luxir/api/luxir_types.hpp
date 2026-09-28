@@ -151,6 +151,8 @@ struct CommitParams {
   std::span<const std::string_view> build_aux_indexes;
   bool wait_for_merges = false;
   uint32_t max_segments = 0;
+  std::string_view wait_for_replicas;
+  std::optional<uint64_t> replication_timeout_ms;
 };
 
 struct Error {
@@ -164,9 +166,23 @@ namespace UpdateResponse_ {
 struct DocError { std::string_view id; std::optional<Error> error; int32_t index = 0; };
 } // namespace UpdateResponse_
 
+struct ReplicaResult {
+  std::optional<uint32_t> wanted;
+  std::optional<uint32_t> serving;
+  std::optional<bool> timed_out;
+};
+
+struct CollectionCommit {
+  std::string_view commit;
+  std::optional<ReplicaResult> replicas;
+};
+
 struct UpdateResponse {
   using Status = luxir::api::UpdateResponse_::Status;
   using DocError = luxir::api::UpdateResponse_::DocError;
+  std::string_view commit;
+  std::optional<ReplicaResult> replicas;
+  map_view<std::string_view, CollectionCommit> commits;
   std::string_view request_id;
   uint64_t update_version = 0;
   std::span<const std::string_view> ids;
@@ -254,6 +270,7 @@ struct QueryCacheStats {
   uint64_t reader_stable_retires = 0;
   bool enabled = false;
 };
+struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
 struct IndexRamStats { uint64_t limit_bytes = 0; uint64_t reserved_bytes = 0; };
 struct StatsTotals {
   uint64_t collections = 0;
@@ -268,7 +285,7 @@ struct StatsTotals {
 struct SegmentStats {
   std::string_view seg;
   std::string_view live_gen;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   uint64_t min_update_version = 0;
   uint64_t max_update_version = 0;
   uint64_t first_commit_time = 0;
@@ -287,8 +304,12 @@ struct IndexStats {
   uint64_t index_gen = 0;
   uint64_t core_gen = 0;
   uint64_t update_version = 0;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   uint64_t active_merges = 0;
+  uint64_t snapshot_pins = 0;
+  uint64_t pin_retained_bytes = 0;
+  uint64_t pin_idle_drops = 0;
+  uint64_t pin_budget_drops = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;
@@ -298,14 +319,41 @@ struct ShardStats {
   uint32_t shard_id = 0;
 };
 struct CollectionStats {
+  uint64_t storage_ram_bytes = 0;
   std::string_view name;
   StatsTotals totals;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
 };
 struct StatsRequest { std::string_view collection; bool segments = false; };
+struct FollowerStats {
+  std::string_view follower;
+  std::string_view collection;
+  std::string_view commit;
+  uint64_t last_seen = 0;
+  std::optional<uint64_t> lag;
+};
+struct ReplicationCollectionStatus {
+  std::string_view name;
+  std::string_view source_commit;
+  std::string_view serving_commit;
+  std::string_view state;
+  uint64_t bytes_downloaded = 0;
+  uint64_t bytes_total = 0;
+  std::string_view last_error;
+  uint64_t next_retry = 0;
+};
+struct ReplicationStatus {
+  std::span<const FollowerStats> followers;
+  std::string_view source;
+  std::string_view follower;
+  std::optional<bool> connected;
+  uint64_t last_contact = 0;
+  std::span<const ReplicationCollectionStatus> collections;
+};
 struct StatsResponse {
+  StorageRamStats storage_ram;
   StatsTotals totals;
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
@@ -461,6 +509,8 @@ struct SearchRequest {
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
   bool profile = false;
   std::int32_t max_parallel = 0;
+  std::string_view min_commit;
+  std::optional<uint64_t> min_commit_timeout_ms;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -634,7 +684,7 @@ LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionP
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
-LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
+LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
@@ -646,9 +696,9 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
-LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
+LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStats) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
-LUXIR_TD(QueryCacheStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 #undef LUXIR_TD
@@ -674,7 +724,7 @@ LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTR
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
-LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
+LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)
@@ -687,10 +737,10 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
-LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
+LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStats) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
-LUXIR_ENTRY(IndexRamStats)
+LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 #undef LUXIR_ENTRY

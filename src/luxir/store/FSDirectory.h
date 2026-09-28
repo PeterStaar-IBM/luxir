@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
 #include "Directory.h"
 
 namespace luxir {
@@ -35,6 +37,13 @@ public:
 
   size_t size() override { return sz_; }
 
+  void prefetch(size_t offset, size_t length) override {
+    if (offset >= sz_ || length == 0) return;
+    static const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t start = offset / pageSize * pageSize;
+    (void)madvise(data_ + start, offset - start + std::min(length, sz_ - offset), MADV_WILLNEED);
+  }
+
   std::string_view read() override {
     return {data_, sz_};
   }
@@ -56,6 +65,7 @@ class FSFile : public File {
   std::filesystem::path tmpPath_;  // write to temp, rename on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
+  XXH3_state_t hash;
 
   // Single reusable write buffer
   std::unique_ptr<char[]> buf_;
@@ -73,6 +83,7 @@ class FSFile : public File {
   }
 
   void writeToFd(const char* data, size_t len) {
+    XXH3_64bits_update(&hash, data, len);
     while (len > 0) {
       auto n = ::write(fd_, data, len);
       if (n < 0) {
@@ -116,7 +127,9 @@ class FSFile : public File {
 
 public:
   FSFile(std::string_view name, const std::filesystem::path& path)
-      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {}
+      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {
+    XXH3_64bits_reset(&hash);
+  }
 
   ~FSFile() override {
     if (fd_ >= 0) {
@@ -125,6 +138,7 @@ public:
   }
 
   size_t size() override { return fileSize_; }
+  uint64_t digest() const override { return XXH3_64bits_digest(&hash); }
 
   void closeFd() {
     if (fd_ >= 0) {
@@ -282,6 +296,10 @@ public:
     accountChange(-(int64_t) ramFile.allocatedBytes());
   }
 
+  uint64_t digest() const override {
+    return delegate ? delegate->digest() : ramFile.digest();
+  }
+
   size_t size() override {
     return delegate != nullptr ? delegate->size() : ramFile.size();
   }
@@ -316,6 +334,11 @@ class FSDirectory : public Directory {
   }
 
 public:
+  void linkFile(Directory& source, std::string_view name) override {
+    auto& fs = dynamic_cast<FSDirectory&>(source.underlying());
+    std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
+  }
+
   explicit FSDirectory(const std::filesystem::path& path) : basePath_(path) {
     std::filesystem::create_directories(basePath_);
   }

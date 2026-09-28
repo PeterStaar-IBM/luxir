@@ -4,7 +4,6 @@
 #pragma once
 
 #include <atomic>
-#include "luxir/util/AtomicSharedPtr.h"
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -34,6 +33,8 @@ class SearchEngine;
 class Library;
 class Collection;
 class LuxirNode;
+class ReplicationCatalog;
+class ReplicationFollower;
 
 // Resolving a request's collection target failed.  The concrete subclasses fix
 // the classification; the base is thrown directly only for internal invariants
@@ -73,7 +74,8 @@ public:
 class Shard {
   Collection& collection; // hard reference to the collection that owns this shard
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
-  std::shared_ptr<IndexWriter> iw;
+  std::unique_ptr<CommitSnapshotRegistry> snapshots;
+  std::shared_ptr<IndexWriter> iw; // absent on read-only collections
 
 public:
   explicit Shard(Collection& collection) : collection(collection) {
@@ -88,6 +90,17 @@ public:
     return iw;
   }
 
+  ~Shard() {
+    if (iw) iw->close();
+    if (snapshots) snapshots->close();
+  }
+  ReaderManager& getReaderManager() const { return snapshots->readers; }
+  CommitSnapshotRegistry& getSnapshots() const { return *snapshots; }
+  std::shared_ptr<IndexWriter> requireIndexWriter() {
+    if (!iw) throw ReadOnlyError("collection has no index writer");
+    return iw;
+  }
+
   std::shared_ptr<Directory> getDirectory() {
     return dir;
   }
@@ -97,6 +110,7 @@ public:
   friend class Collection;
   friend class Library;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 class Schema;
@@ -109,20 +123,20 @@ namespace api::SchemaRequest_ { enum class Mode; }
 class Collection {
   std::string name;
   std::string unavailableReason;  // non-empty means resolution rejects the collection
-  AtomicSharedPtr<Schema> schema;  // administration/stats; searches use their reader's schema
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
-  std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
-  std::mutex schemaMutex_;  // serializes complete schema transactions on the calling thread
 public:
+  std::string getUnavailableReason() const;
 
   std::shared_ptr<Shard> getShard() {
     return shard;
   }
 
+  ReaderManager& getReaderManager() const { return shard->getReaderManager(); }
+
   // Returns the latest published schema for administration and stats.
   std::shared_ptr<Schema> getSchema() {
-    return schema.load();
+    return getReaderManager().getSchema();
   }
 
   // The schema mutation transaction: applies `def` to the current schema
@@ -132,21 +146,13 @@ public:
   std::shared_ptr<Schema> updateSchema(const luxir::api::SchemaDef& def,
                                        luxir::api::SchemaRequest_::Mode mode);
 
-  // Atomically replaces the schema and persists it to the shard's Directory.
+  // Publishes a copy of this schema over the last committed physical snapshot.
   void setSchema(std::shared_ptr<Schema> newSchema);
 
-  uint64_t schemaGen() const { return schemaGen_.load(); }
-
-  // Load the latest schema from the Directory.
-  // Returns true if schema was loaded, false if no schema file found.
-  bool loadSchema();
-
-private:
-  void setSchemaLocked(std::shared_ptr<Schema> newSchema);
-  void persistSchemaLocked(std::shared_ptr<Schema> newSchema);
 
   friend class Library;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 
@@ -164,12 +170,19 @@ private:
   std::string name;
   SharedLazyMap<std::string, Collection> collections;
   friend class LuxirNode;
+  friend class ReplicationFollower;
 };
 
 
 
 class LuxirNode {
+  std::shared_ptr<ReplicationCatalog> replication;
+  std::unique_ptr<ReplicationFollower> follower;
+  friend class ReplicationFollower;
 public:
+  ReplicationFollower* getFollower() { return follower.get(); }
+  bool following() const { return !config.replication.source.empty(); }
+  ReplicationCatalog& getReplication() { return *replication; }
   static constexpr std::string_view kDefaultCollectionName = "main";
 
   struct CollectionEntry {
@@ -179,7 +192,8 @@ public:
   };
 
   LuxirNode() : LuxirNode(LuxirConfig{}) {}
-  explicit LuxirNode(LuxirConfig config);
+  enum class Mode { SERVE, PULL };
+  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE);
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
@@ -193,6 +207,8 @@ public:
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
   // of collections.
 
+  uint64_t storageBytes(std::string_view collection = {}) const { return dirFactory->storageBytes(collection); }
+
   std::shared_ptr<Collection> getCollection(std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(std::string_view name);
 
@@ -202,6 +218,7 @@ public:
   // Snapshot fully-created root collections without waiting for creations in
   // flight. Unavailable tombstones retain their recorded error.
   std::vector<CollectionEntry> collectionEntries();
+  std::map<std::string, CommitId> replicationCollections();
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(Library* library, std::string_view name);
@@ -231,7 +248,11 @@ public:
 private:
 
   void createSingletons();
-  std::shared_ptr<Collection> initCollection(const std::string& name);
+  void observeCollection(const std::string& name, Collection& collection);
+  void deleteLocalCollection(std::string_view name);
+  std::shared_ptr<Collection> makeCollection(const std::string& name, std::shared_ptr<Directory> directory);
+  std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {},
+                                             std::shared_ptr<Directory> directory = {});
   // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
   static void validateCollectionName(std::string_view name);

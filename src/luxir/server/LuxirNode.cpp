@@ -1,15 +1,21 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/server/ReplicationCatalog.h"
 #include "LuxirNode.h"
+#include "ReplicationFollower.h"
+#include "ReplicationState.h"
+#include "luxir/util/Uuid.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/Signal.h"
 
 #include <algorithm>
 #include <exception>
@@ -18,12 +24,7 @@
 
 namespace luxir {
 
-static constexpr std::string_view SCHEMA_PREFIX = "_schema_";
 static constexpr std::string_view DELETING_REASON = "being deleted";
-
-static std::string schemaFileName(uint64_t gen) {
-  return std::string(SCHEMA_PREFIX) + Postings::getSortableString(gen);
-}
 
 void LuxirNode::validateCollectionName(std::string_view name) {
   constexpr std::size_t kMaxCollectionNameBytes = 255;
@@ -52,167 +53,58 @@ void LuxirNode::validateCollectionName(std::string_view name) {
 
 std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
-  // One transaction per collection: read-current -> apply -> resolve ->
-  // persist -> swap.  Without the lock, two concurrent SETs could each build
-  // from the same base and the second swap would silently drop the first's
-  // fields (and their persistence passes would delete each other's files).
-  std::lock_guard lock(schemaMutex_);
-  std::shared_ptr<Schema> newSchema;
-  if (mode == luxir::api::SchemaRequest_::Mode::SET) {
-    auto current = getSchema();
-    newSchema = Schema::fromProto(def, current.get());
-  } else {
-    newSchema = Schema::fromProto(def);
-  }
-  setSchemaLocked(newSchema);
-  return newSchema;
+  if (!shard->iw) throw ReadOnlyError("collection has no writer");
+  return shard->iw->updateSchema([&](const Schema* current) {
+    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+  });
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
-  std::lock_guard lock(schemaMutex_);
-  setSchemaLocked(std::move(newSchema));
+  if (!shard->iw) throw ReadOnlyError("collection has no writer");
+  shard->iw->setSchema(std::move(newSchema));
 }
 
-void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
-  newSchema->gen_ = schemaGen_.load();
-  auto previous = getSchema();
-  newSchema->inheritIntroductions(previous.get());
-  persistSchemaLocked(newSchema);
-  if (shard && shard->iw) shard->iw->setSchema(std::move(newSchema));
-}
-
-void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
-  uint64_t gen = schemaGen_++;
-  newSchema->gen_ = gen;
-
-  // Persist the schema source def to the Directory.  The durable file IS the
-  // publication point: once it is synced, restart would load this generation,
-  // so the in-memory swap below must happen (and the caller must see success)
-  // regardless of anything after the sync.  A failure BEFORE the sync removes
-  // the staged file so a partial write can never be selected at startup.
-  if (shard && shard->dir && !newSchema->sourceDef_.empty()) {
-    std::string stored = newSchema->encodeStored();
-    std::string fileName = schemaFileName(gen);
-    try {
-      auto file = shard->dir->createFile(fileName);
-      OutputStream out;
-      out.setFile(&*file);
-      out.write(stored.data(), stored.size());
-      out.close();
-      shard->dir->finishFile(*file);
-
-      std::vector<std::string> syncFiles = {fileName, "."};
-      shard->dir->sync(syncFiles);
-    } catch (...) {
-      try {
-        shard->dir->deleteFile(fileName);
-      } catch (...) {
-        LOG_WARN("failed to remove staged schema file {} after write failure", fileName);
-      }
-      throw;
-    }
-
-    // Publish for schema GET handlers. setSchemaLocked hands the same schema
-    // to the writer after persistence returns.
-    schema.store(std::move(newSchema));
-
-    // Best-effort cleanup of older generations: the new schema is already
-    // durable and published, so a cleanup failure must not fail the request
-    // (loadSchema always picks the highest generation anyway).
-    try {
-      std::vector<Directory::FileInfo> files;
-      shard->dir->listFiles(files);
-      for (const auto& f : files) {
-        if (f.name.starts_with(SCHEMA_PREFIX) && f.name != fileName) {
-          shard->dir->deleteFile(f.name);
-        }
-      }
-    } catch (const std::exception& e) {
-      LOG_WARN("failed to clean up old schema files: {}", e.what());
-    }
-    return;
-  }
-
-  schema.store(std::move(newSchema));
-}
-
-
-bool Collection::loadSchema() {
-  std::lock_guard lock(schemaMutex_);
-  if (!shard || !shard->dir) return false;
-
-  // Find the latest schema file by lexicographic order (sortable naming).
-  std::string lastSchemaFile;
-  std::vector<Directory::FileInfo> files;
-  shard->dir->listFiles(files);
-  for (const auto& f : files) {
-    if (f.name.starts_with(SCHEMA_PREFIX)) {
-      if (f.name > lastSchemaFile) lastSchemaFile = f.name;
-    }
-  }
-
-  while (!lastSchemaFile.empty()) {
-    auto file = shard->dir->openFile(lastSchemaFile, true);
-    if (file) {
-      InputStream is = file->getInputStream();
-      std::span<const char> bytes((const char*)is.ptr(), is.left());
-      std::shared_ptr<Schema> newSchema;
-      try {
-        newSchema = Schema::decodeStored(std::as_bytes(bytes));
-      } catch (const std::runtime_error& e) {
-        throw std::runtime_error("Failed to parse schema file: " + lastSchemaFile + ": " + e.what());
-      }
-
-      // Parse the gen back from the sortable filename suffix
-      auto genStr = std::string_view(lastSchemaFile).substr(SCHEMA_PREFIX.size());
-      uint64_t gen = Postings::parseSortableString(genStr);
-
-      newSchema->gen_ = gen;
-      schemaGen_ = gen + 1;  // next setSchema will use gen+1
-      schema.store(newSchema);
-      if (shard->iw) shard->iw->setSchema(std::move(newSchema));
-      return true;
-    }
-
-    // File was deleted by a concurrent setSchema - rescan for the latest.
-    lastSchemaFile.clear();
-    files.clear();
-    shard->dir->listFiles(files);
-    for (const auto& f : files) {
-      if (f.name.starts_with(SCHEMA_PREFIX)) {
-        if (f.name > lastSchemaFile) lastSchemaFile = f.name;
-      }
-    }
-  }
-
-  return false;
-}
-
-
-LuxirNode::LuxirNode(LuxirConfig config)
+LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   : config(std::move(config)) {
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
   // created by createSingletons() take a pointer to the budget.
+  if (this->config.promote && !this->config.replication.source.empty()) throw std::invalid_argument("--promote cannot be combined with --replicate-from");
+  if (this->config.promote && this->config.store.backend == "ram") throw std::invalid_argument("--promote requires the FS backend");
   this->config.resolveRamBudgets();
+  auto& replicationConfig = this->config.replication;
+  replicationConfig.validate();
+  replication = std::make_shared<ReplicationCatalog>(std::chrono::milliseconds(
+      replicationConfig.follower_timeout_ms));
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
+  if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  if (follower) follower->stop();
+  replication->closeWaits();
 }
 
 std::shared_ptr<Collection> LuxirNode::getCollection(std::string_view name) {
   return getCollection(root.get(), name);
 }
 
+std::string Collection::getUnavailableReason() const {
+  if (!unavailableReason.empty()) return unavailableReason;
+  if (shard && shard->iw) {
+    if (auto failure = shard->iw->getFailureReason()) return *failure;
+  }
+  return {};
+}
+
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {
-  if (collection && !collection->unavailableReason.empty()) {
-    throw CollectionUnavailableError(
-        "collection '" + collection->name + "' is unavailable: " +
-        collection->unavailableReason);
+  if (collection) {
+    auto reason = collection->getUnavailableReason();
+    if (!reason.empty()) throw CollectionUnavailableError(
+        "collection '" + collection->name + "' is unavailable: " + reason);
   }
   return collection;
 }
@@ -245,6 +137,7 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view na
 }
 
 std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, std::string_view name) {
+  if (following()) return getCollection(library, name);
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
     throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
@@ -253,17 +146,20 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, s
   std::string collectionName(name);
   validateCollectionName(collectionName);
 
+  bool createdHere = false;
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() -> std::shared_ptr<Collection> {
     if (!config.ingest.auto_create_collection) {
       return nullptr;
     }
     auto created = initCollection(collectionName);
+    createdHere = true;
     LOG_INFO("Created collection: {}", collectionName);
     return created;
   });
   if (!collection) {
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
+  if (createdHere) replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
   return checkLoaded(std::move(collection));
 }
 
@@ -278,7 +174,7 @@ std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {
   using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
   root->collections.dataMap.cvisit_all([&](const auto& elem) {
     if (auto* collection = std::get_if<Pointer>(&elem.second)) {
-      entries.push_back({elem.first, *collection, (*collection)->unavailableReason});
+      entries.push_back({elem.first, *collection, (*collection)->getUnavailableReason()});
     }
   });
   std::sort(entries.begin(), entries.end(),
@@ -286,8 +182,19 @@ std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {
   return entries;
 }
 
+std::map<std::string, CommitId> LuxirNode::replicationCollections() {
+  std::map<std::string, CommitId> result;
+  for (const auto& entry : collectionEntries()) {
+    if (auto shard = entry.collection->getShard()) {
+      if (auto snapshot = shard->getSnapshots().snapshot()) result.emplace(entry.name, snapshot->id);
+    }
+  }
+  return result;
+}
+
 std::shared_ptr<Collection> LuxirNode::createCollection(
     Library* library, std::string_view name, const api::SchemaDef* schema) {
+  if (following()) throw ReadOnlyError("cannot create collections on a follower");
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
     throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
@@ -301,11 +208,12 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() {
     createdHere = true;
     std::shared_ptr<Collection> created;
+    std::shared_ptr<Directory> directory;
     try {
-      created = initCollection(collectionName);
-      if (schema != nullptr) {
-        created->updateSchema(*schema, api::SchemaRequest_::Mode::SET);
-      }
+      auto initialSchema = Schema::createDefaultSchema();
+      if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
+      directory = dirFactory->create(collectionName, true);
+      created = initCollection(collectionName, std::move(initialSchema), directory);
       LOG_INFO("Created collection: {}", collectionName);
       return created;
     } catch (...) {
@@ -314,7 +222,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
         if (created && created->shard && created->shard->iw) {
           created->shard->iw->close();
         }
-        dirFactory->remove(collectionName);
+        if (directory) dirFactory->remove(collectionName);
       } catch (const std::exception& e) {
         auto tombstone = std::make_shared<Collection>();
         tombstone->name = collectionName;
@@ -335,10 +243,16 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   if (!createdHere) {
     throw CollectionExistsError("collection '" + collectionName + "' already exists");
   }
+  replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
   return collection;
 }
 
 void LuxirNode::deleteCollection(std::string_view name) {
+  if (follower) { follower->deleteOrphan(name); return; }
+  deleteLocalCollection(name);
+}
+
+void LuxirNode::deleteLocalCollection(std::string_view name) {
   if (!root) throw CollectionResolutionError(ErrorKind::INTERNAL, "internal", "root library is not initialized");
 
   // Empty means the request never named a collection - a malformed request,
@@ -373,6 +287,7 @@ void LuxirNode::deleteCollection(std::string_view name) {
     if (collection->shard && collection->shard->iw) {
       collection->shard->iw->close();
     }
+    if (collection->shard) collection->shard->snapshots->close();
     dirFactory->remove(collectionName);
   } catch (const std::exception& e) {
     auto failed = std::make_shared<Collection>();
@@ -392,35 +307,99 @@ void LuxirNode::deleteCollection(std::string_view name) {
     throw std::runtime_error(
         "collection '" + collectionName + "' tombstone disappeared during deletion");
   }
+  replication->remove(collectionName);
 }
 
-std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name) {
-  auto col = std::make_shared<Collection>();
-  col->name = name;
-  col->shard = std::make_shared<Shard>(*col);
-  col->shard->dir = dirFactory->create(name);
-
-  // Set default schema initially (without persisting, gen=0 means not yet persisted)
-  auto defaultSchema = Schema::createDefaultSchema();
-  defaultSchema->gen_ = 0;
-  col->schema.store(std::move(defaultSchema));
-
-  // The writer must start with the persisted schema, including on reopen.
-  col->loadSchema();
-  col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
-    col->getSchema(), &indexRamBudget,
-    FilterCacheConfig{.maxBytes = config.queryCacheBytes}, config.index.merge_factor);
-  col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
-  col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
-
+std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
+                                                       std::shared_ptr<Directory> directory) {
+  auto container = directory ? std::move(directory) : dirFactory->create(name);
+  auto selection = DirectoryFactory::current(*container);
+  bool creating = selection.incarnation.empty();
+  if (creating) {
+    std::vector<Directory::FileInfo> files;
+    container->listFiles(files);
+    if (!files.empty() || !dirFactory->listDirectories(name).empty()) throw std::runtime_error("Collection files exist without CURRENT");
+    if (config.read_only) throw ReadOnlyError("Collection has no CURRENT");
+    selection.incarnation = newUuid();
+  }
+  if (!creating && !config.read_only) {
+    auto selected = dirFactory->create(name + "/" + selection.incarnation);
+    auto manifest = Manifest::load(*selected);
+    if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
+      auto recovered = dirFactory->copySnapshot(name, selection, manifest);
+      LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
+                name, manifest.generation, manifest.highestGeneration, recovered.incarnation);
+      dirFactory->select(name, recovered);
+      selection = std::move(recovered);
+    }
+  }
+  auto col = makeCollection(name, dirFactory->create(name + "/" + selection.incarnation));
+  if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+  if (config.read_only) {
+    col->shard->snapshots->openLocalSnapshot();
+  } else {
+    col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
+      std::move(initialSchema), &indexRamBudget,
+      config.index.merge_factor, creating ? selection.incarnation : std::string{});
+    col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
+    col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  }
+  if (col->shard->snapshots->snapshot()->id.incarnation != selection.incarnation) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
+  if (creating) dirFactory->select(name, selection);
+  if (!config.read_only) for (const auto& incarnation : dirFactory->listDirectories(name)) {
+    if (incarnation == selection.incarnation) continue;
+    try { dirFactory->remove(name + "/" + incarnation); }
+    catch (const std::exception& e) { LOG_WARN("Unselected incarnation cleanup '{}' failed: {}", name, e.what()); }
+  }
+  observeCollection(name, *col);
+  Signal::emit("collectionInitialized", col.get());
   return col;
 }
 
+std::shared_ptr<Collection> LuxirNode::makeCollection(const std::string& name, std::shared_ptr<Directory> directory) {
+  auto col = std::make_shared<Collection>();
+  col->name = name;
+  col->shard = std::make_shared<Shard>(*col);
+  col->shard->dir = std::move(directory);
+
+  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
+      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+  auto& snapshots = *col->shard->snapshots;
+  const auto& policy = config.replication;
+  snapshots.setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
+  return col;
+}
+
+void LuxirNode::observeCollection(const std::string& name, Collection& collection) {
+  collection.getShard()->getSnapshots().onPublish = [catalog = replication, name](const CommitSnapshot& snapshot) noexcept {
+    catalog->changed(name, snapshot.id.incarnation);
+  };
+}
+
 void LuxirNode::createSingletons() {
+  root = std::make_shared<Library>();
   if (config.store.backend == "fs") {
     dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
   } else {
-    dirFactory = std::make_unique<RAMDirFactory>();
+    if (config.store.ram_limit_mb > UINT64_MAX / (1024 * 1024)) throw std::invalid_argument("store.ram_limit_mb is too large");
+    dirFactory = std::make_unique<RAMDirFactory>(config.store.ram_limit_mb * 1024 * 1024, [weak = std::weak_ptr(root)] {
+      auto library = weak.lock();
+      if (!library) return false;
+      std::vector<std::shared_ptr<Collection>> collections;
+      using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
+      library->collections.dataMap.cvisit_all([&](const auto& entry) {
+        if (auto col = std::get_if<Pointer>(&entry.second)) collections.push_back(*col);
+      });
+      std::shared_ptr<Collection> oldest;
+      auto time = CommitSnapshotRegistry::Clock::time_point::max();
+      for (const auto& col : collections) if (auto shard = col->getShard()) {
+        auto created = shard->getSnapshots().oldestReclaimableReservation();
+        if (created && *created < time) { time = *created; oldest = col; }
+      }
+      if (!oldest) return false;
+      oldest->getShard()->getSnapshots().reclaimOldestReservation();
+      return true; // A concurrent drop also warrants retrying the allocation.
+    });
   }
 
   if (config.store.checked_dir.sync != "off") {
@@ -433,20 +412,76 @@ void LuxirNode::createSingletons() {
     dirFactory = std::make_unique<ReadOnlyDirFactory>(std::move(dirFactory));
   }
 
-  root = std::make_shared<Library>();
+  if (following()) {
+    if (config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
+    follower = std::make_unique<ReplicationFollower>(*this);
+    return;
+  }
+
+  std::map<std::string, std::string> promotionErrors;
+  // Promotion is a storage operation before any writer opens the replicas.
+  // Hard links retain immutable data without copying it. CURRENT still selects
+  // the old complete snapshot until the new root and directory are durable.
+  if (!config.read_only && config.store.backend == "fs") {
+    FSDirectory metadata(config.store.data_dir);
+    if (auto binding = metadata.openFile("replication.json")) {
+      if (!config.promote) throw std::runtime_error("Follower-bound data directory: use --promote to start a writer");
+      auto state = ReplicationState::read(*binding);
+      for (const auto& name : dirFactory->listDirectories()) {
+        try {
+          auto selection = DirectoryFactory::current(*dirFactory->create(name));
+          if (selection.incarnation.empty()) continue;
+          auto& promoted = state.collections[name].promoted;
+          if (promoted.empty()) {
+            Signal::emit("replicationPromotingCollection", (void*)&name);
+            auto old = dirFactory->create(name + "/" + selection.incarnation);
+            auto next = dirFactory->copySnapshot(name, selection, Manifest::load(*old));
+            promoted = next.incarnation;
+            state.write(metadata);
+          }
+          if (selection.incarnation != promoted) dirFactory->select(name, {promoted});
+        } catch (const std::exception& e) {
+          promotionErrors.emplace(name, "promotion failed: " + std::string(e.what()));
+        }
+      }
+      if (promotionErrors.empty()) {
+        metadata.deleteFile("replication.json");
+        std::array<std::string, 1> directory{"."};
+        metadata.sync(directory);
+        LOG_INFO("promoted from follower of {}", state.source);
+      } else {
+        LOG_WARN("Promotion from follower of {} incomplete; restart with --promote to retry failed collections", state.source);
+      }
+    } else if (config.promote) {
+      LOG_INFO("No follower binding; nothing to promote");
+    }
+  }
 
   // Discover existing collections from the store, or create default "main".
-  auto existing = dirFactory->listCollections();
-  if (existing.empty()) {
-    existing.emplace_back(kDefaultCollectionName);
-  }
+  auto existing = dirFactory->listDirectories();
+  bool createDefault = existing.empty();
+  if (createDefault) existing.emplace_back(kDefaultCollectionName);
 
   for (const auto& name : existing) {
     try {
       validateCollectionName(name);
+      if (auto failed = promotionErrors.find(name); failed != promotionErrors.end()) throw std::runtime_error(failed->second);
+      if (!createDefault && DirectoryFactory::current(*dirFactory->create(name)).incarnation.empty()) {
+        auto container = dirFactory->create(name);
+        std::vector<Directory::FileInfo> files;
+        container->listFiles(files);
+        auto children = dirFactory->listDirectories(name);
+        if (!config.read_only && files.empty() && std::ranges::all_of(children, isUuid)) {
+          dirFactory->remove(name);
+          LOG_INFO("Removed unselected collection: {}", name);
+          continue;
+        }
+        throw std::runtime_error("Collection has no CURRENT");
+      }
       root->collections.getOrCreate(name, [&]() {
         return initCollection(name);
       });
+      replication->changed();
       LOG_INFO("Loaded collection: {}", name);
     } catch (const std::exception& e) {
       // Keep the node up: register a tombstone so the name resolves to a clear

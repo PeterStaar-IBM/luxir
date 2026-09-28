@@ -68,7 +68,17 @@ Rough hierarchy:
 */
 
 
+void ReplicationConfig::validate() const {
+  if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
+    throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
+  }
+}
+
 void LuxirConfig::addOptions(CLI::App& app) {
+  app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
+  app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
+  app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
+  app.add_flag("--promote", promote, "Promote a follower directory to an independent writer");
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
@@ -109,9 +119,18 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
 
+  app.add_option("--replication.pin-idle-timeout-ms", replication.pin_idle_timeout_ms,
+                 "Replication reservation idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
+  app.add_option("--replication.pin-retained-bytes", replication.pin_retained_bytes,
+                 "Per-collection bytes retained only by reservations")->transform(CLI::AsSizeValue(false))
+      ->default_val(replication.pin_retained_bytes);
+  app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
+                 "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
+
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
       ->check(CLI::IsMember({"ram", "fs"}));
+  app.add_option("--store.ram-limit-mb", store.ram_limit_mb, "RAM storage allocation limit in MiB (0 = unlimited)")->check(CLI::Range((uint64_t)0, UINT64_MAX / (1024 * 1024)));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
@@ -186,7 +205,7 @@ void LuxirConfig::resolveRamBudgets() {
     // being the search-side caches and reader structures.  A read-only node
     // never indexes, so it carves out nothing (0 is also "unlimited" for the
     // budget object, which is moot when nothing ever reserves against it).
-    index.max_ram_mb = read_only ? 0 : max_ram_mb / 2;
+    index.max_ram_mb = (read_only || !replication.source.empty()) ? 0 : max_ram_mb / 2;
   }
 
   if (index.max_inverter_ram_mb < 0) {
@@ -200,6 +219,7 @@ void LuxirConfig::resolveRamBudgets() {
 }
 
 void LuxirConfig::normalize() {
+  replication.validate();
   resolveRamBudgets();
 
   // Only an explicitly set share can exceed the node budget; a derived one is

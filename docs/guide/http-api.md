@@ -161,16 +161,16 @@ when supplied in the body or as a URL parameter.
 | `invalid_request` | 400 (405 for `method_not_allowed`) | The request as written cannot be served. |
 | `not_found` | 404 | The route or the collection does not exist. |
 | `already_exists` | 409 | Creating a collection that already exists. |
-| `failed_precondition` | 403 | The node's state forbids the operation, such as `--read-only`. |
+| `failed_precondition` | 403 (409 for `commit_incarnation_mismatch`) | The node's state forbids the operation, such as `--read-only`. |
 | `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
 | `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
 | `internal` | 500 | A server-side failure the request did not cause. |
 
-A failure detected before submission returns the kind's HTTP status and this
+A failure detected before output returns the kind's HTTP status and this
 body. A wrong method on a known path returns `405` with an `Allow` header.
 
 Once a chunked response has begun, its HTTP status cannot change, so a search
-that fails after submission arrives with HTTP 200 as the final NDJSON line in
+that fails after output starts arrives with HTTP 200 as the final NDJSON line in
 the same shape, `{"request_id": ..., "error": {...}, "warnings": [...]}`,
 with no `docs` or `ops`. That final error invalidates every earlier batch line
 of the same request: a client that streamed `more: true` lines must discard
